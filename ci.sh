@@ -2,8 +2,8 @@
 set -e
 
 echo "📦 Installing system dependencies..."
-sudo apt-get update -qq
-sudo apt-get install -y -qq p7zip-full qbittorrent-nox python3 python3-pip curl
+ apt-get update -qq
+ apt-get install -y -qq p7zip-full qbittorrent-nox python3 python3-pip curl
 
 echo "🐍 Installing Python libraries..."
 pip3 install --no-cache-dir --break-system-packages requests qbittorrent-api natsort
