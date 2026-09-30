@@ -2,6 +2,9 @@ name: Tubi Downloader and GoFile Sync
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   download-process-upload:
