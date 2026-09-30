@@ -1,0 +1,467 @@
+name: Tubi Downloader and GoFile Sync
+
+on:
+  workflow_dispatch:
+
+jobs:
+  download-process-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js & Python
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install System & Python Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+          python3 -m pip install --upgrade pip
+          pip install natsort requests
+
+      - name: Install Tubi Downloader CLI
+        run: |
+          npm install --global @warren-bank/node-hls-downloader-tubitv
+
+      - name: Download Content from Tubi
+        run: |
+          mkdir -p downloads_raw
+          cd downloads_raw
+          tubidl -mc 5 -u "https://tubitv.com/series/300005292/the-carol-burnett-show"
+
+      - name: Process Subtitles and Convert to MKV
+        run: |
+          echo "🎬 Processing downloads and embedding SRT subtitles..."
+          python3 - << 'EOF'
+          import os
+          import subprocess
+          import re
+
+          input_dir = "downloads_raw"
+          output_dir = "downloads"
+
+          os.makedirs(output_dir, exist_ok=True)
+          print(f"Created output directory: {output_dir}")
+
+          found_srt = False
+          processed_videos = []
+
+          for root, _, files in os.walk(input_dir):
+              for file in files:
+                  if file.endswith(".mp4") and file == "video.mp4":
+                      video_path = os.path.join(root, file)
+
+                      # General dynamic extraction for Tubi folder structure:
+                      # /input_dir/Show Name/S01E0X - Episode Name/mp4/video.mp4
+                      rel_path = os.path.relpath(video_path, input_dir)
+                      path_parts = rel_path.split(os.sep)
+
+                      # Fallback to current folder structure if specific pattern match is unavailable
+                      if len(path_parts) >= 3:
+                          episode_dir = path_parts[-3]
+                          show_dir = path_parts[-4] if len(path_parts) >= 4 else ""
+                          episode_name = f"{show_dir} - {episode_dir}".strip(" -")
+                      else:
+                          episode_name = os.path.splitext(file)[0]
+
+                      srt_files_found = []
+                      # Check current directory
+                      for s_file in os.listdir(root):
+                          if s_file.endswith(".srt"):
+                              srt_files_found.append(os.path.join(root, s_file))
+
+                      # Check parent directory
+                      parent_root = os.path.dirname(root)
+                      if os.path.exists(parent_root):
+                          for s_file in os.listdir(parent_root):
+                              if s_file.endswith(".srt"):
+                                  srt_files_found.append(os.path.join(parent_root, s_file))
+
+                      # Remove duplicates
+                      srt_files_found = list(set(srt_files_found))
+
+                      output_filename = f"{episode_name}.mkv"
+                      output_path = os.path.join(output_dir, output_filename)
+
+                      if srt_files_found:
+                          found_srt = True
+                          ffmpeg_command = ["ffmpeg", "-i", video_path]
+                          for srt_file in srt_files_found:
+                              ffmpeg_command.extend(["-i", srt_file])
+
+                          ffmpeg_command.extend(["-map", "0:v", "-map", "0:a"])
+
+                          for i in range(len(srt_files_found)):
+                              ffmpeg_command.extend(["-map", f"{i+1}:s"])
+                              ffmpeg_command.extend([f"-metadata:s:s:{i}", "language=eng"])
+
+                          ffmpeg_command.extend(["-c", "copy", "-c:s", "srt", "-y", output_path])
+
+                          print(f"\nCombining video '{video_path}' with subtitles into '{output_path}'")
+                          try:
+                              subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+                              print(f"Successfully combined: {output_path}")
+                              processed_videos.append(output_path)
+                          except subprocess.CalledProcessError as e:
+                              print(f"Error combining '{video_path}':\nStderr: {e.stderr}")
+                      else:
+                          print(f"\nNo SRT found for: {video_path}. Converting to MKV...")
+                          try:
+                              subprocess.run(["ffmpeg", "-i", video_path, "-c", "copy", "-y", output_path],
+                                             check=True, capture_output=True, text=True)
+                              processed_videos.append(output_path)
+                              print(f"Successfully converted: {output_path}")
+                          except subprocess.CalledProcessError as e:
+                              print(f"Error converting '{video_path}':\nStderr: {e.stderr}")
+
+          if not found_srt:
+              print("No SRT files found. Videos converted without subtitle tracks.")
+          EOF
+
+      - name: Organize Files into Dedicated Folders
+        run: |
+          echo "📂 Organizing all movies and TV shows into dedicated directories..."
+          python3 - << 'EOF'
+          import os, shutil, re
+          from datetime import datetime
+          from collections import defaultdict
+          from natsort import natsorted
+          from urllib.parse import unquote
+
+          folder = "downloads"
+          video_ext = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v')
+
+          def sanitize_path(name):
+              if not name:
+                  return "unnamed"
+              name = unquote(name)
+              sanitized = re.sub(r'[\\/*?:"<>|;]', '_', name)
+              sanitized = re.sub(r'[\x00-\x1f\x7f]', '', sanitized)
+              return sanitized.strip('. ') or "unnamed"
+
+          def parse_tv_show(name):
+              m = re.search(r'(?i)(?:^(.*?)[.\s_\[\(-]+)?S(\d{1,2})(?:[EX\d\-]|\b)', name)
+              if m:
+                  return m.group(1), m.group(2)
+              m = re.search(r'(?i)(?:^(.*?)[.\s_\[\(-]+)?(\d{1,2})x\d{1,2}', name)
+              if m:
+                  return m.group(1), m.group(2)
+              m = re.search(r'(?i)(?:^(.*?)[.\s_\[\(-]+)?Season[.\s_-]*(\d{1,2})', name)
+              if m:
+                  return m.group(1), m.group(2)
+              return None, None
+
+          sanitized_names_map = {}
+
+          # 0. Sanitize all raw files & directories on disk, tracking original names
+          for r, dirs, files in os.walk(folder, topdown=False):
+              for f in files:
+                  clean_f = sanitize_path(f)
+                  if clean_f != f:
+                      old_p = os.path.join(r, f)
+                      new_p = os.path.join(r, clean_f)
+                      if not os.path.exists(new_p):
+                          shutil.move(old_p, new_p)
+                      sanitized_names_map[new_p] = f
+              for d in dirs:
+                  clean_d = sanitize_path(d)
+                  if clean_d != d:
+                      old_p = os.path.join(r, d)
+                      new_p = os.path.join(r, clean_d)
+                      if not os.path.exists(new_p):
+                          shutil.move(old_p, new_p)
+                      sanitized_names_map[new_p] = d
+
+          def move_files_to_group_dir(group_name, file_paths, base_dir, original_group_name=None):
+              clean_group_name = sanitize_path(group_name)
+              group_dir = os.path.join(base_dir, clean_group_name)
+              os.makedirs(group_dir, exist_ok=True)
+              
+              log_entries = []
+              orig_folder = original_group_name or group_name
+              if orig_folder != clean_group_name:
+                  log_entries.append(f"[FOLDER RENAMED]\nOriginal : {orig_folder}\nSanitized: {clean_group_name}\n")
+
+              files_to_move = list(file_paths)
+              for p in file_paths:
+                  base_stem = os.path.splitext(p)[0]
+                  for sub_ext in ('.srt', '.ass', '.vtt', '.sub'):
+                      sub_file = base_stem + sub_ext
+                      if os.path.exists(sub_file) and sub_file not in files_to_move:
+                          files_to_move.append(sub_file)
+
+              for p in files_to_move:
+                  if os.path.exists(p):
+                      clean_filename = os.path.basename(p)
+                      orig_filename = sanitized_names_map.get(p, clean_filename)
+                      
+                      if orig_filename != clean_filename:
+                          log_entries.append(f"[FILE RENAMED]\nOriginal : {orig_filename}\nSanitized: {clean_filename}\n")
+
+                      dst = os.path.join(group_dir, clean_filename)
+                      if p != dst and not os.path.exists(dst):
+                          shutil.move(p, dst)
+
+              if log_entries:
+                  log_file_path = os.path.join(group_dir, "name_mapping.txt")
+                  with open(log_file_path, "w", encoding="utf-8") as lf:
+                      lf.write("==================================================\n")
+                      lf.write("             NAME SANITIZATION LOG                \n")
+                      lf.write("==================================================\n\n")
+                      lf.write("\n".join(log_entries))
+                      lf.write("\n==================================================\n")
+                  print(f"📝 Created sanitization log: {log_file_path}", flush=True)
+
+          # Group video files by their parent directory first
+          parent_folder_vids = defaultdict(list)
+          for r, _, files in os.walk(folder):
+              for f in files:
+                  if f.lower().endswith(video_ext):
+                      full_path = os.path.join(r, f)
+                      parent_folder_vids[r].append(full_path)
+
+          series_groups = defaultdict(list)
+          movies = []
+          short_series_pool = []
+
+          for parent_dir, vids in parent_folder_vids.items():
+              rel_parent = os.path.relpath(parent_dir, folder)
+              if rel_parent != "." and len(vids) > 3:
+                  print(f"📁 Preserving existing subfolder structure with {len(vids)} videos: {rel_parent}", flush=True)
+                  continue
+
+              for vid_path in vids:
+                  vid_name = os.path.basename(vid_path)
+                  parent_name = os.path.basename(os.path.dirname(vid_path))
+                  
+                  raw_title, s_num = parse_tv_show(vid_name)
+                  if not s_num:
+                      raw_title, s_num = parse_tv_show(parent_name)
+
+                  if s_num:
+                      raw_title = raw_title.strip('. -_[]()') if raw_title else "Season"
+                      s_num_formatted = f"{int(s_num):02d}"
+                      group_key = f"{raw_title}_S{s_num_formatted}"
+                      series_groups[group_key].append(vid_path)
+                  else:
+                      movies.append(vid_path)
+
+          for group_key in natsorted(series_groups.keys()):
+              vids = natsorted(series_groups[group_key])
+              if len(vids) > 3:
+                  first_ep_path = vids[0]
+                  clean_first_ep_name = os.path.splitext(os.path.basename(first_ep_path))[0]
+                  orig_first_ep_name = os.path.splitext(sanitized_names_map.get(first_ep_path, os.path.basename(first_ep_path)))[0]
+                  
+                  print(f"📁 TV Series (>3 ep) -> Folder named after 1st ep: {clean_first_ep_name}", flush=True)
+                  move_files_to_group_dir(clean_first_ep_name, vids, folder, original_group_name=orig_first_ep_name)
+              else:
+                  short_series_pool.extend(vids)
+
+          if len(short_series_pool) > 3:
+              current_date = datetime.now().strftime("%Y-%m-%d")
+              print(f"📁 Bundling loose series pool ({len(short_series_pool)} vids) into date folder: {current_date}", flush=True)
+              move_files_to_group_dir(current_date, short_series_pool, folder)
+          else:
+              movies.extend(short_series_pool)
+
+          for movie_path in natsorted(movies):
+              clean_movie_stem = os.path.splitext(os.path.basename(movie_path))[0]
+              orig_movie_stem = os.path.splitext(sanitized_names_map.get(movie_path, os.path.basename(movie_path)))[0]
+              
+              print(f"🎬 Creating dedicated folder for movie/item: {clean_movie_stem}", flush=True)
+              move_files_to_group_dir(clean_movie_stem, [movie_path], folder, original_group_name=orig_movie_stem)
+
+          for r, dirs, files in os.walk(folder, topdown=False):
+              if r == folder: continue
+              if not os.listdir(r):
+                  shutil.rmtree(r, ignore_errors=True)
+          EOF
+
+      - name: Split Oversized Folders (17GB Limit)
+        run: |
+          echo "✂️ Checking folder sizes and splitting folders over 17GB..."
+          python3 - << 'EOF'
+          import os
+          import re
+          import shutil
+          from natsort import natsorted
+
+          downloads_dir = "downloads"
+          MAX_BYTES = 17 * 1024 * 1024 * 1024  # 17 GB limit
+
+          def sanitize_path(name):
+              sanitized = re.sub(r'[\\/*?:"<>|;]', '_', name)
+              sanitized = re.sub(r'[\x00-\x1f\x7f]', '', sanitized)
+              return sanitized.strip('. ') or "unnamed"
+
+          if os.path.exists(downloads_dir):
+              entries = natsorted(os.listdir(downloads_dir))
+              for entry in entries:
+                  entry_path = os.path.join(downloads_dir, entry)
+                  
+                  if os.path.isdir(entry_path):
+                      all_files = []
+                      total_folder_size = 0
+                      
+                      for root, _, files in os.walk(entry_path):
+                          for f in files:
+                              fp = os.path.join(root, f)
+                              sz = os.path.getsize(fp)
+                              all_files.append((fp, sz))
+                              total_folder_size += sz
+
+                      if total_folder_size > MAX_BYTES:
+                          size_gb = total_folder_size / (1024 ** 3)
+                          print(f"📦 Folder '{entry}' is {size_gb:.2f} GB (>17GB). Splitting into parts...", flush=True)
+                          
+                          all_files = natsorted(all_files, key=lambda x: x[0])
+                          part_num = 1
+                          current_part_size = 0
+                          
+                          for fp, sz in all_files:
+                              if current_part_size + sz > MAX_BYTES and current_part_size > 0:
+                                  part_num += 1
+                                  current_part_size = 0
+                              
+                              part_dir_name = sanitize_path(f"{entry}_Part_{part_num}")
+                              part_dir_path = os.path.join(downloads_dir, part_dir_name)
+                              os.makedirs(part_dir_path, exist_ok=True)
+                              
+                              rel_path = os.path.relpath(fp, entry_path)
+                              target_fp = os.path.join(part_dir_path, rel_path)
+                              os.makedirs(os.path.dirname(target_fp), exist_ok=True)
+                              
+                              shutil.move(fp, target_fp)
+                              current_part_size += sz
+                              print(f"  └─ Moved to {part_dir_name}: {os.path.basename(fp)}", flush=True)
+                          
+                          shutil.rmtree(entry_path, ignore_errors=True)
+                          print(f"✅ Finished splitting '{entry}' into {part_num} parts.", flush=True)
+          EOF
+
+      - name: Parallel Upload to GoFile
+        run: |
+          echo "📤 Running Parallel Multi-Threaded Uploads to GoFile..."
+          python3 - << 'EOF'
+          import os
+          import re
+          import subprocess
+          import requests
+          import time
+          import fcntl
+          from concurrent.futures import ThreadPoolExecutor
+          from natsort import natsorted
+
+          GOFILE_TOKEN = 'VoTnBsgTAiTqm97X6FmvdmBswsMPl6SG'
+          PARENT_FOLDER_ID = '6af360d4-d348-470b-8d25-40e961cb9565'
+          FOLDER_PATH = 'downloads'
+
+          def sanitize_path(name):
+              sanitized = re.sub(r'[\\/*?:"<>|;]', '_', name)
+              sanitized = re.sub(r'[\x00-\x1f\x7f]', '', sanitized)
+              return sanitized.strip('. ') or "unnamed"
+
+          try:
+              srv_res = requests.get("https://api.gofile.io/servers", timeout=10).json()
+              if srv_res.get('status') == 'ok' and srv_res.get('data', {}).get('servers'):
+                  SERVER = srv_res['data']['servers'][0]['name']
+                  UPLOAD_URL = f"https://{SERVER}.gofile.io/contents/uploadfile"
+              else:
+                  UPLOAD_URL = "https://store1.gofile.io/contents/uploadfile"
+          except Exception as e:
+              print(f"Failed to fetch GoFile server ({e}), using default endpoint.")
+              UPLOAD_URL = "https://store1.gofile.io/contents/uploadfile"
+
+          def create_gofile_folder(folder_name, parent_id=""):
+              try:
+                  clean_folder_name = sanitize_path(folder_name)
+                  headers = {"Authorization": f"Bearer {GOFILE_TOKEN}"} if GOFILE_TOKEN else {}
+                  data = {"folderName": clean_folder_name}
+                  if parent_id:
+                      data["parentFolderId"] = parent_id
+                  res = requests.post("https://api.gofile.io/contents/createFolder", json=data, headers=headers, timeout=15).json()
+                  if res.get('status') == 'ok':
+                      new_id = res['data']['id']
+                      print(f"📁 Created GoFile Folder: {clean_folder_name} (ID: {new_id})", flush=True)
+                      return new_id
+              except Exception as e:
+                  print(f"⚠ Failed to create folder {folder_name} on GoFile: {e}", flush=True)
+              return parent_id
+
+          def upload_single_file(item_info):
+              file_path, target_folder_id = item_info
+              filename = os.path.basename(file_path)
+              file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+              print(f"⬆️ [START] Uploading: {filename} ({file_size_mb:.2f} MB)", flush=True)
+              
+              curl_cmd = [
+                  "curl", "-X", "POST", UPLOAD_URL,
+                  "-F", f'file=@"{file_path}"'
+              ]
+              if GOFILE_TOKEN:
+                  curl_cmd.extend(["-H", f"Authorization: Bearer {GOFILE_TOKEN}"])
+              if target_folder_id:
+                  curl_cmd.extend(["-F", f"folderId={target_folder_id}"])
+                  
+              curl_cmd.extend(["--max-time", "3600"])
+              
+              proc = subprocess.Popen(curl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              
+              fd = proc.stderr.fileno()
+              fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+              fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+              
+              last_print_time = time.time()
+              buffer = b""
+              
+              while proc.poll() is None:
+                  try:
+                      chunk = proc.stderr.read(1024)
+                      if chunk:
+                          buffer += chunk
+                          if b'\r' in buffer or b'\n' in buffer:
+                              lines = buffer.replace(b'\r', b'\n').split(b'\n')
+                              buffer = lines[-1]
+                              valid_lines = [L.decode('utf-8', errors='ignore').strip() for L in lines[:-1] if L.strip()]
+                              if valid_lines:
+                                  last_line = valid_lines[-1]
+                                  if time.time() - last_print_time >= 30:
+                                      print(f"📤 Progress [{filename[:25]}]: {last_line}", flush=True)
+                                      last_print_time = time.time()
+                  except Exception:
+                      pass
+                  time.sleep(0.5)
+                  
+              stdout, stderr = proc.communicate()
+              if proc.returncode == 0:
+                  print(f"✅ Finished uploading {filename}: {stdout.decode('utf-8', errors='ignore').strip()}", flush=True)
+              else:
+                  err_msg = stderr.decode('utf-8', errors='ignore').strip() if stderr else 'Unknown error'
+                  print(f"❌ Curl Error uploading {filename}: {err_msg}", flush=True)
+
+          if os.path.exists(FOLDER_PATH):
+              upload_tasks = []
+              
+              for entry in natsorted(os.listdir(FOLDER_PATH)):
+                  full_path = os.path.join(FOLDER_PATH, entry)
+                  
+                  if os.path.isdir(full_path):
+                      gofile_subfolder_id = create_gofile_folder(entry, PARENT_FOLDER_ID)
+                      for root, _, files in os.walk(full_path):
+                          for f in files:
+                              if not any(ext in f for ext in [".!qB", ".part", ".aria2"]):
+                                  upload_tasks.append((os.path.join(root, f), gofile_subfolder_id))
+                  elif os.path.isfile(full_path):
+                      if not any(ext in entry for ext in [".!qB", ".part", ".aria2"]):
+                          upload_tasks.append((full_path, PARENT_FOLDER_ID))
+              
+              if upload_tasks:
+                  print(f"🚀 Launching 4 parallel upload workers for {len(upload_tasks)} files...", flush=True)
+                  with ThreadPoolExecutor(max_workers=4) as executor:
+                      executor.map(upload_single_file, upload_tasks)
+          EOF
